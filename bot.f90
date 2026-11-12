@@ -96,6 +96,18 @@ subroutine scan(handle,heading,arc,pitch)
   integer(c_int32_t) :: code
   code=cy_scanner_heading(handle,heading);code=cy_scanner_arc(handle,arc);code=cy_scanner_pitch(handle,pitch)
 end subroutine
+! The arena's calibration kernel, xorshift-sqrt v1; safe to delete.
+function calibration_work(work,tick) result(value)
+  integer(c_int64_t), value :: work,tick
+  integer(c_int64_t) :: x,i
+  real(c_double) :: sum,value
+  x=ieor(88172645463325252_c_int64_t,tick);sum=0
+  do i=1,work
+    x=ieor(x,shiftl(x,13));x=ieor(x,shiftr(x,7));x=ieor(x,shiftl(x,17))
+    sum=sum+sqrt(real(shiftr(x,11),c_double))
+  end do
+  value=real(mod(int(floor(sum,kind=c_int64_t),c_int64_t)+shiftr(x,40),1000000_c_int64_t),c_double)
+end function
 subroutine turn(handle)
   type(c_ptr), value :: handle
   type(cy_vec3) :: position,gravity
@@ -155,6 +167,12 @@ subroutine turn(handle)
         code=cy_angles_angle_diff(bearing,heading,delta);code=cy_angles_clamp(delta/30,-1.0_c_double,1.0_c_double,turning)
         code=cy_angles_clamp((climb-pitch)/30,-1.0_c_double,1.0_c_double,pitching);call drive(handle,0.8_c_double,turning,pitching)
       end if
+    end if
+  end if
+  ! Only the arena's rate calibration sends this; safe to delete.
+  if(cy_raw_number(handle,'state.calibration.work',22_c_int32_t,work)==CY_OK)then
+    if(work>=1)then
+      code=cy_status_text(handle,'WORK',4_c_int32_t);code=cy_status_value(handle,calibration_work(int(work,c_int64_t),int(tick,c_int64_t)))
     end if
   end if
 end subroutine
