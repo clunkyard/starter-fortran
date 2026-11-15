@@ -1,5 +1,7 @@
 ! A robot on the Clunkyard core's Fortran binding. The core owns tracking,
 ! geometry and protocol handling; these procedures choose the tactics.
+! It searches with a broad scan, narrows the beam on a contact, and leads
+! shots from a line through its recent sightings.
 ! Clunkyard robot API 2.0.0: one core under every language, the same
 ! answers everywhere. Facts (a call shows its arguments):
 ! match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -49,6 +51,17 @@ implicit none
 type(c_ptr) :: robot=c_null_ptr
 integer(c_int32_t) :: status,event
 integer :: dodge_ticks=0,dodges=0
+integer(c_int32_t) :: slot=0
+! Bearing is earned: a scan contact's bearing is off by up to its bearing_error
+! (degrees, a fixed share of the arc), so a wide beam finds a robot and a narrow
+! one aims at it. Contacts within 120 units are exact.
+real(c_double), parameter :: search_arc=40.0_c_double  ! degrees: sweeps the circle in half a second
+real(c_double), parameter :: hold_width=60.0_c_double  ! units across at the target: it stays in the beam from tick to tick
+real(c_double), parameter :: min_arc=6.0_c_double      ! degrees: the narrowest the beam holds
+integer(c_int32_t), parameter :: window=12             ! ticks of sightings the aim averages
+integer, parameter :: sightings=8                      ! narrow sightings in the window before a shot
+integer(c_int32_t), parameter :: look_every=40         ! ticks between looks around the target, for a nearer robot
+integer(c_int32_t), parameter :: reacquire=10          ! ticks to look again where a lost target was
 abstract interface
   function query(handle,out) bind(C) result(status)
     import
@@ -99,6 +112,39 @@ subroutine scan(handle,heading,arc,pitch)
   integer(c_int32_t) :: code
   code=cy_scanner_heading(handle,heading);code=cy_scanner_arc(handle,arc);code=cy_scanner_pitch(handle,pitch)
 end subroutine
+! A straight line through the narrowest of the last `window` ticks' sightings:
+! where the robot is now and how fast it moves. Each sighting is off by its
+! bearing_error; the line averages that out.
+subroutine fit(handle,target_slot,tick,found,position,velocity,kept)
+  type(c_ptr), value :: handle
+  integer(c_int32_t), value :: target_slot,tick
+  logical :: found
+  type(cy_vec3) :: position,velocity
+  integer :: kept
+  type(cy_sighting) :: history(32)
+  integer(c_int32_t) :: total,rate,code
+  logical :: keep(32)
+  real(c_double), allocatable :: t(:),x(:),y(:),z(:)
+  real(c_double) :: best,t0,spread,sx,sy,sz
+  found=.false.;kept=0
+  if(cy_tracker_history(handle,target_slot,history,32_c_int32_t,total)/=CY_OK)return
+  if(total<2)return
+  keep(1:total)=history(1:total)%tick>tick-window
+  if(count(keep(1:total))<2)return
+  best=minval(history(1:total)%bearing_error,keep(1:total))
+  ! Keep the narrow ones: a look's wide sighting drops out.
+  keep(1:total)=keep(1:total).and.history(1:total)%bearing_error<=1.5_c_double*best
+  kept=count(keep(1:total))
+  if(kept<2)return
+  t=real(pack(history(1:total)%tick,keep(1:total)),c_double)
+  x=pack(history(1:total)%position%x,keep(1:total));y=pack(history(1:total)%position%y,keep(1:total));z=pack(history(1:total)%position%z,keep(1:total))
+  t0=sum(t)/kept;t=t-t0;spread=sum(t*t)
+  ! Least squares on each axis: slope per tick, and the line's position now.
+  sx=sum(t*(x-sum(x)/kept))/spread;sy=sum(t*(y-sum(y)/kept))/spread;sz=sum(t*(z-sum(z)/kept))/spread
+  code=cy_match_tick_rate(handle,rate)
+  position=cy_vec3(sum(x)/kept+sx*(tick-t0),sum(y)/kept+sy*(tick-t0),sum(z)/kept+sz*(tick-t0))
+  velocity=cy_vec3(sx*rate,sy*rate,sz*rate);found=.true.
+end subroutine
 subroutine turn(handle)
   type(c_ptr), value :: handle
   type(cy_vec3) :: position,gravity
@@ -111,27 +157,63 @@ subroutine turn(handle)
   type(cy_zone) :: zone
   integer(c_int32_t) :: code,tick,is_3d,can_fire,mode
   real(c_double) :: heading,pitch,throttle,power,delta,bearing,distance,elevation,error,across,up,arc,sweep,margin,away,control,climb,turning,pitching,work
-  logical :: free_flight,fired,left
+  logical :: free_flight,fired,left,seen,found,aimed,ready
+  integer(c_int32_t) :: last_seen
+  integer :: fit_count
+  type(cy_vec3) :: fit_position,fit_velocity,spot
+  real(c_double) :: hold
   type(cy_contact) :: cues(32)
   integer(c_int32_t) :: heard
   code=cy_me_position(handle,position);code=cy_arena_gravity(handle,gravity);code=cy_scanner_last(handle,last)
   heading=get(handle,cy_me_heading);pitch=get(handle,cy_me_pitch)
   code=cy_clock_tick(handle,tick);code=cy_match_is_3d(handle,is_3d);free_flight=is_3d/=0.and.gravity%z==0
   code=cy_drive_brake(handle,0.2_c_double)
+  seen=.false.;last_seen=0
+  if(slot/=0)seen=cy_tracker_last_seen(handle,slot,last_seen)==CY_OK
   if(cy_sensors_nearest(handle,target)==CY_OK)then
+    slot=target%slot
     throttle=0.2_c_double;if(target%range>350)throttle=0.7_c_double;if(target%range<200)throttle=-0.4_c_double
-    call drive(handle,throttle,steer(target%bearing,heading),steer(target%elevation,pitch));call scan(handle,target%bearing,20.0_c_double,target%elevation)
-    ! cy_gun_lead is the intercept if the target holds course.
+    call drive(handle,throttle,steer(target%bearing,heading),steer(target%elevation,pitch))
+    ! Halve the beam each tick until it is hold_width across at the target:
+    ! narrow enough for a precise bearing, wide enough to keep it in.
+    hold=max(min_arc,2*atan2(hold_width/2,target%range)*180/acos(-1.0_c_double))
+    ! In a crowd a narrow beam sees one robot. Every look_every ticks, widen it for a tick.
+    if(mod(tick,look_every)==0)then
+      arc=search_arc
+    else
+      arc=max(hold,min(search_arc,last%arc/2))
+    end if
+    call scan(handle,target%bearing,arc,target%elevation)
     code=cy_gun_power_for_flight_time(handle,target%range,1.0_c_double,power)
-    if(cy_gun_lead(handle,target,power,aim)/=CY_OK)then
+    if(target%bearing_error>0)then
+      ! A noisy contact: lead the fitted line, and fire only once it rests on enough sightings.
+      call fit(handle,target%slot,tick,found,fit_position,fit_velocity,fit_count)
+      aimed=.false.;if(found)aimed=cy_gun_lead_point(handle,fit_position,fit_velocity,power,aim)==CY_OK
+      ready=aimed.and.fit_count>=sightings
+    else
+      ! An exact contact: cy_gun_lead is the intercept if the target holds course.
+      aimed=cy_gun_lead(handle,target,power,aim)==CY_OK;ready=.true.
+    end if
+    if(.not.aimed)then
       aim%heading=target%bearing;aim%pitch=target%elevation
     end if
     code=cy_gun_aim_heading(handle,aim%heading);code=cy_gun_aim_pitch(handle,aim%pitch)
     code=cy_gun_aim_now(handle,now);code=cy_angles_angle_diff(aim%heading,now%heading,delta);code=cy_gun_can_fire(handle,power,10.0_c_double,can_fire)
-    if(abs(delta)<3.and.abs(aim%pitch-now%pitch)<3.and.can_fire/=0)then
+    if(ready.and.abs(delta)<3.and.abs(aim%pitch-now%pitch)<3.and.can_fire/=0)then
       code=cy_gun_fire(handle);code=cy_gun_power(handle,power)
     end if
-    code=cy_status_text(handle,'TRACK',5_c_int32_t);code=cy_status_value(handle,target%range)
+    if(ready)then
+      code=cy_status_text(handle,'TRACK',5_c_int32_t)
+    else
+      code=cy_status_text(handle,'NARROW',6_c_int32_t)
+    end if
+    code=cy_status_value(handle,target%range)
+  else if(seen.and.tick-last_seen<=reacquire)then
+    ! Lost it: look again where it was last seen, widening the beam, before searching.
+    code=cy_tracker_position(handle,slot,spot);code=cy_angles_bearing_to(position,spot,bearing)
+    elevation=0;if(free_flight)code=cy_angles_elevation_to(position,spot,elevation)
+    call drive(handle,0.5_c_double,steer(bearing,heading),steer(elevation,pitch));call scan(handle,bearing,min(search_arc,last%arc*2),elevation)
+    code=cy_status_text(handle,'REACQUIRE',9_c_int32_t)
   else if(cy_tracker_cue(handle,cue)==CY_OK)then
     code=cy_angles_bearing_to(position,cue%position,bearing);code=cy_angles_distance(position,cue%position,distance)
     elevation=0;if(free_flight)code=cy_angles_elevation_to(position,cue%position,elevation)
@@ -141,7 +223,7 @@ subroutine turn(handle)
     call scan(handle,bearing+across,arc,elevation+up);code=cy_status_text(handle,'CUE',3_c_int32_t);code=cy_status_value(handle,distance)
   else
     code=cy_angles_normalize(last%heading+36,sweep);up=0;if(free_flight)up=real(mod(tick/10,3)-1,c_double)*35
-    call drive(handle,0.5_c_double,0.33_c_double,steer(0.0_c_double,pitch));call scan(handle,sweep,40.0_c_double,up)
+    call drive(handle,0.5_c_double,0.33_c_double,steer(0.0_c_double,pitch));call scan(handle,sweep,search_arc,up)
     code=cy_status_text(handle,'SEARCH',6_c_int32_t)
   end if
   ! A simple dodge: vary it, or predict the shooter.
