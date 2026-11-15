@@ -7,7 +7,8 @@
 ! clock: tick seconds remaining_ticks
 ! arena: size gravity terrain_kind ground_height(x y)
 ! me: health position velocity heading pitch roll angular_velocity
-!   attitude grounded altitude applied
+!   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+!   from_mount(heading pitch) mount_toward(point)
 ! battery: charge capacity regen sustainable_drive compute
 !   drive_cost(fraction)
 ! drive: hover_lift
@@ -29,7 +30,8 @@
 ! score: me best armour
 ! angles: normalize(degrees) angle_diff(target current)
 !   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-!   distance(a b) clamp(value low high)
+!   distance(a b) to_chassis(heading pitch attitude)
+!   from_chassis(heading pitch attitude) clamp(value low high)
 ! raw: number(path) text(path) has(path) flag(path) count(path) line()
 ! Controls: drive.set(throttle turn pitch_turn)
 !   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -46,6 +48,7 @@ use clunkyard
 implicit none
 type(c_ptr) :: robot=c_null_ptr
 integer(c_int32_t) :: status,event
+integer :: dodge_ticks=0,dodges=0
 abstract interface
   function query(handle,out) bind(C) result(status)
     import
@@ -106,16 +109,19 @@ subroutine turn(handle)
   type(cy_direction) :: now
   type(cy_storm) :: storm
   type(cy_zone) :: zone
-  integer(c_int32_t) :: code,tick,is_3d,can_fire
+  integer(c_int32_t) :: code,tick,is_3d,can_fire,mode
   real(c_double) :: heading,pitch,throttle,power,delta,bearing,distance,elevation,error,across,up,arc,sweep,margin,away,control,climb,turning,pitching,work
-  logical :: free_flight
+  logical :: free_flight,fired,left
+  type(cy_contact) :: cues(32)
+  integer(c_int32_t) :: heard
   code=cy_me_position(handle,position);code=cy_arena_gravity(handle,gravity);code=cy_scanner_last(handle,last)
   heading=get(handle,cy_me_heading);pitch=get(handle,cy_me_pitch)
   code=cy_clock_tick(handle,tick);code=cy_match_is_3d(handle,is_3d);free_flight=is_3d/=0.and.gravity%z==0
   code=cy_drive_brake(handle,0.2_c_double)
   if(cy_sensors_nearest(handle,target)==CY_OK)then
-    throttle=0.2;if(target%range>350)throttle=0.7;if(target%range<200)throttle=-0.4
+    throttle=0.2_c_double;if(target%range>350)throttle=0.7_c_double;if(target%range<200)throttle=-0.4_c_double
     call drive(handle,throttle,steer(target%bearing,heading),steer(target%elevation,pitch));call scan(handle,target%bearing,20.0_c_double,target%elevation)
+    ! cy_gun_lead is the intercept if the target holds course.
     code=cy_gun_power_for_flight_time(handle,target%range,1.0_c_double,power)
     if(cy_gun_lead(handle,target,power,aim)/=CY_OK)then
       aim%heading=target%bearing;aim%pitch=target%elevation
@@ -137,6 +143,28 @@ subroutine turn(handle)
     code=cy_angles_normalize(last%heading+36,sweep);up=0;if(free_flight)up=real(mod(tick/10,3)-1,c_double)*35
     call drive(handle,0.5_c_double,0.33_c_double,steer(0.0_c_double,pitch));call scan(handle,sweep,40.0_c_double,up)
     code=cy_status_text(handle,'SEARCH',6_c_int32_t)
+  end if
+  ! A simple dodge: vary it, or predict the shooter.
+  fired=.false.
+  if(cy_sensors_cues(handle,cues,size(cues),heard)==CY_OK)fired=any(cues(1:heard)%source==CY_SOURCE_MUZZLE)
+  if(dodge_ticks==0.and.fired)then
+    dodges=dodges+1;dodge_ticks=10
+  end if
+  if(dodge_ticks>0)then
+    ! Odd dodges go left, even ones right; turn +1 and strafe -1 go left.
+    left=mod(dodges,2)==1;work=merge(1.0_c_double,-1.0_c_double,left);dodge_ticks=dodge_ticks-1
+    code=cy_match_control(handle,mode)
+    if(mode==CY_CONTROL_FORCES)then
+      code=cy_drive_throttle(handle,0.5_c_double);code=cy_drive_strafe(handle,-work)
+    else
+      code=cy_drive_throttle(handle,1.0_c_double);code=cy_drive_turn(handle,work)
+    end if
+    if(left)then
+      code=cy_status_text(handle,'dodge:left',10_c_int32_t)
+    else
+      code=cy_status_text(handle,'dodge:right',11_c_int32_t)
+    end if
+    code=cy_status_value(handle,real(dodges,c_double))
   end if
   if(get(handle,cy_battery_charge)<get(handle,cy_battery_capacity)/4)code=cy_drive_throttle(handle,get(handle,cy_drive_get_throttle)*0.5_c_double)
   if(cy_nav_storm(handle,storm)==CY_OK)then
